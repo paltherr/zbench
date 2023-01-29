@@ -1,0 +1,237 @@
+#!/usr/bin/env zsh
+
+################################################################################
+# Function "zbench"
+
+# NAME
+#
+# zbench – Benchmarks a Zsh command.
+
+# SYNOPSIS
+#
+# zbench [-d] [-p <prelude>] [--] [<command-part>…]
+
+# DESCRIPTION
+#
+# Benchmarks the provided Zsh command by running it repeatedly in
+# increasingly larger loops until a loop's run time reaches a
+# predetermined target time. After each loop prints timing stats.
+#
+# Benchmarking is performed by timing sub-shells running "repeat"
+# loops of the command of increasingly larger sizes. Thus, timing
+# stats include a tiny constant overhead due to the "repeat" loop and
+# a decreasingly smaller overhead due to the sub-shell. The latter
+# becomes negligible with larger loops. The former remains constant
+# and may be non-negligible for small/short commands. It can be
+# estimated by running "zbench" with no command, which benchmarks an
+# empty "repeat" loop.
+#
+# The command can be any valid Zsh command. However, the command may
+# not exit its shell (e.g., explicit "exit", error, ...). Since
+# benchmarking relies on repeatedly running the command in a loop, it
+# precludes commands that exit their shell. The benchmarking also only
+# makes sense for commands where each run takes about the same time.
+# In particular, commands whose run time depends on how often the
+# command has already run lead to bogus results. In other words, each
+# run of the command should be independent of previous runs.
+#
+# In addition to the command, a prelude can be provided. The prelude
+# is run once before each "repeat" loop in a (new) parent shell of the
+# loop's shell. Thus, the prelude doesn't contribute to the timing
+# stats but anything it defines or configures is accessible to the
+# command.
+#
+# The "zbench" command can be run as an external command or as a Zsh
+# function in a Zsh script or in an interactive Zsh shell. In case of
+# the latter, the command (and the prelude) have access to anything
+# defined in the Zsh script/shell from which it is invoked.
+
+# OPTIONS
+#
+# -d
+# --debug
+#
+#   Print debug information. It includes the benchmarking parameters,
+#   the output of a prelude run, and the output of three successive
+#   command runs.
+#
+# -p <prelude>
+# --prelude <prelude>
+#
+#   Specify the signal to send to the shell process(es). The signal
+#   can be specified by name or number. The default signal is HUP.
+#   Note that some signals may be ignored by the shell processes or
+#   may not lead to their termination.
+#
+# --
+#
+#   Signal the end of options. Any arguments after "--" are treated as
+#   command parts.
+
+# ENVIRONMENT VARIABLES
+#
+# - ZBENCH_MULTIPLIER
+#
+#   The factor by which each new "repeat" loop is increased.
+#
+# - ZBENCH_TARGET_MS
+#
+#   The target time in milliseconds. Once a loop's run time reaches
+#   this time, benchmarking stops.
+#
+# - ZBENCH_BOTTOM_MS
+#
+#   The bottom time in milliseconds. As long as the previous loop's
+#   run time multiplied by ZBENCH_MULTIPLIER hasn't reached the bottom
+#   time, the next loop is sized to reach it. In other words, initial
+#   loops may grow faster than specified by ZBENCH_MULTIPLIER until
+#   their run time reach the bottom time.
+
+( # Run in a sub-shell to avoid polluting the caller's name space.
+
+  local caller_options=(${(kv)options[@]});
+  set -eu
+
+  function zbench-printf() {
+    local format=$1; shift 1;
+    print -Pf "%s$format%s\n" "%F{green}" "$@" "%f";
+  }
+
+  function zbench-debug() {
+    print -P "%F{yellow}$*%f" 1>&2;
+  }
+
+  function zbench-abort() {
+    print -P "%F{red}$ZSH_ARGZERO: $*%f" 1>&2;
+    exit 1;
+  }
+
+  local -i zbench_multiplier=${${(M)${ZBENCH_MULTIPLIER:-}:#<2->}:-4};
+  local -i zbench_target_time=${${(M)${ZBENCH_TARGET_MS:-}:#<1->}:-10*1000}*1000;
+  local -i zbench_bottom_time=${${(M)${ZBENCH_BOTTOM_MS:-}:#<1->}:-10}*1000;
+
+  local zbench_prelude="";
+  local zbench_command=();
+  local zbench_debug=false;
+  while (($#)); do
+    case $1 in
+      -d | --debug)
+        zbench_debug=true; shift 1;
+        ;;
+      -p | --prelude )
+        [[ $# -ge 2 ]] || usage "Option $1 requires an argument.";
+        zbench_prelude=$2; shift 2;
+        ;;
+      -- )
+        shift 1;
+        zbench_command=("$@"); shift $#;
+        ;;
+      -* )
+        zbench-abort "Unrecognised option: ${(qqq)1}";
+        ;;
+      * )
+        zbench_command=("$@"); shift $#;
+        ;;
+    esac;
+  done;
+
+  if $zbench_debug; then
+    # Print the parameters.
+    zbench-debug "Multiplier : $((zbench_multiplier))";
+    zbench-debug "Time target: $((zbench_target_time/1000)) ms";
+    zbench-debug "Time bottom: $((zbench_bottom_time/1000)) ms";
+    zbench-debug "Prelude    : ${(qqq)zbench_prelude}";
+    zbench-debug "Command    : ${(qqq)zbench_command}";
+    zbench-debug;
+
+    # Run the prelude and 3 times the command.
+    exec 3>&1;
+    local zbench_run_result=$(
+      set +e;
+      zbench_run_result=$(eval \
+          "options=(\$caller_options);" \
+          "" \
+          "zbench-debug \"Running prelude...\";" \
+          "1>&3 { $zbench_prelude };" \
+          "zbench-debug \"...ended with exit status \$?.\";" \
+          "echo -n END;" \
+          "(" \
+          "  repeat 3; do" \
+          "    zbench-debug;" \
+          "    zbench-debug \"Running command...\";" \
+          "    1>&3 { $zbench_command };" \
+          "    zbench-debug \"...ended with exit status \$?.\";" \
+          "  done;" \
+          "  echo -n END;" \
+          ")" \
+          );
+      echo -n $?:$zbench_run_result);
+    exec 3<&-;
+    [[ $zbench_run_result = *:ENDEND ]] ||
+      zbench-debug "...triggered a shell exit with status ${zbench_run_result%%:*}.";
+    zbench-debug;
+  fi;
+
+
+  local -i zbench_run_count=1;
+  while true; do
+
+    local zbench_run_result=$(
+      set +e;
+      zbench_run_result=$(eval \
+          "options=(\$caller_options);" \
+          "1>/dev/null 2>&1 { $zbench_prelude };" \
+          "echo -n END;" \
+          "TIMEFMT='%uE,%uU,%uS';" \
+          "2>&1 time (" \
+          "  1>/dev/null 2>&1 repeat $zbench_run_count do $zbench_command ; done;" \
+          "  echo -n END)");
+      echo $?:$zbench_run_result);
+
+    [[ $zbench_run_result = *:END* ]] ||
+      zbench-abort "The prelude triggered a shell exit with status ${zbench_run_result%%:*}.";
+    [[ $zbench_run_result = *:ENDEND* ]] ||
+      zbench-abort "The command triggered a shell exit with status ${zbench_run_result%%:*}.";
+
+    local -a zbench_times=(${${(s:,:)${zbench_run_result#*:ENDEND}}%us});
+    local -i zbench_elapsed=zbench_times[1];
+    local -i zbench_cpu_usr=zbench_times[2];
+    local -i zbench_cpu_sys=zbench_times[3];
+    local -i zbench_cpu_tot=zbench_cpu_usr+zbench_cpu_sys;
+
+    zbench-printf \
+        "CPU/Clk:%9.3f/%9.3f µs/run (%7.3f/%7.3f s)%5.1f%% Sys, Runs: %d" \
+        "1.0*zbench_cpu_tot/zbench_run_count" \
+        "1.0*zbench_elapsed/zbench_run_count" \
+        "1.0*zbench_cpu_tot/1000/1000" \
+        "1.0*zbench_elapsed/1000/1000" \
+        "1.0*zbench_cpu_sys/zbench_cpu_tot*100" \
+        "zbench_run_count";
+
+    # Use the CPU time as the determining time.
+    local zbench_run_time=$zbench_cpu_tot;
+
+    # If we got close enough to the target time, stop.
+    if ((zbench_run_time > zbench_target_time/zbench_multiplier**0.5)); then
+      break;
+    fi;
+
+    # For the next iteration, aim for a multiple of the last run time.
+    local -i zbench_next_time_aim=zbench_multiplier*zbench_run_time;
+
+    # Aim at least for the bottom time.
+    if ((zbench_next_time_aim < zbench_bottom_time)); then
+      zbench_next_time_aim=zbench_bottom_time;
+    fi;
+
+    # If the aim is close to the target time, aim for the latter.
+    if ((zbench_next_time_aim > zbench_target_time/zbench_multiplier)); then
+      zbench_next_time_aim=$zbench_target_time;
+    fi;
+
+    # Estimate the number of runs needed to reach the time aim.
+    zbench_run_count=zbench_run_count*zbench_next_time_aim/zbench_run_time;
+  done;
+)
+
+################################################################################
